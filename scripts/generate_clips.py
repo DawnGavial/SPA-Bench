@@ -1,15 +1,14 @@
 """
-Video Processing Script based on Annotations
-
-This script reads a JSON annotation file, trims the corresponding video segments, applies spatial cropping if necessary, and adapts to any changes in frame rate or resolution between the annotation and the source video.
+This script reads a JSON annotation file, trims the corresponding video segments, applies spatial cropping if necessary, and adapts to any changes in frame rate or resolution between the annotation and the actual source video.
 Finally, it outputs the processed clips and an updated JSON annotation file.
 
 Requirements:
     - Python 3.x
-    - OpenCV (pip install opencv-python)
+    - OpenCV
+    - FFmpeg (must be installed and added to the system's PATH)
 
 Usage:
-    python process_dataset_opencv.py --annotation <path_to_json> --source_dir <source_video_directory> --output_dir <output_directory> [--output_json <output_json_name>]
+    python generate_clips.py --annotation <path_to_json> --source_dir <source_video_directory> --output_dir <output_directory> [--output_json <output_json_name>]
 
 Arguments:
     --annotation  : (Required) Path to the original JSON annotation file.
@@ -18,16 +17,17 @@ Arguments:
     --output_json : (Optional) Name of the updated JSON file. Defaults to 'labels_updated.json'.
 
 Example:
-    python process_dataset_opencv.py --annotation data.json --source_dir ./source_videos --output_dir ./output_clips
+    python generate_clips.py --annotation labels_main.json --source_dir ./source_videos --output_dir ./output_clips
 """
 
 import json
 import os
 import cv2
 import copy
+import subprocess
 import argparse
 
-def process_videos_opencv(annotation_file, source_dir, output_dir, output_json_name):
+def process_videos_with_audio(annotation_file, source_dir, output_dir, output_json_name):
     with open(annotation_file, 'r', encoding='utf-8') as f:
         annotations = json.load(f)
 
@@ -46,6 +46,7 @@ def process_videos_opencv(annotation_file, source_dir, output_dir, output_json_n
             print(f"  [Warning] Source video not found: {source_path}. Skipping.")
             continue
 
+
         cap = cv2.VideoCapture(source_path)
         if not cap.isOpened():
             print(f"  [Error] Cannot open video: {source_path}")
@@ -54,11 +55,12 @@ def process_videos_opencv(annotation_file, source_dir, output_dir, output_json_n
         actual_fps = cap.get(cv2.CAP_PROP_FPS)
         actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
 
         if actual_fps <= 0:
             print(f"  [Error] Invalid FPS read: {actual_fps}. Skipping this file.")
-            cap.release()
             continue
+
 
         orig_fps = item['fps']
         orig_w = item['original_resolution']['w']
@@ -69,6 +71,9 @@ def process_videos_opencv(annotation_file, source_dir, output_dir, output_json_n
         start_frame = int(item['absolute_start_frame'] * fps_ratio)
         end_frame = int(item['absolute_end_frame'] * fps_ratio)
 
+        start_sec = start_frame / actual_fps
+        duration_sec = (end_frame - start_frame + 1) / actual_fps
+
         new_item = copy.deepcopy(item)
 
         if abs(fps_ratio - 1.0) > 1e-3:
@@ -78,48 +83,52 @@ def process_videos_opencv(annotation_file, source_dir, output_dir, output_json_n
             new_item['timestamp2_frame_relative'] = int(item['timestamp2_frame_relative'] * fps_ratio)
             new_item['fps'] = actual_fps
 
+
         w_ratio = actual_w / orig_w if orig_w > 0 else 1.0
         h_ratio = actual_h / orig_h if orig_h > 0 else 1.0
 
         is_cropped = item.get('is_cropped', False)
+        crop_filter = ""
         if is_cropped:
             crop_box = item['crop_box']
-            x1 = max(0, int(crop_box['x'] * w_ratio))
-            y1 = max(0, int(crop_box['y'] * h_ratio))
-            x2 = min(actual_w, x1 + int(crop_box['w'] * w_ratio))
-            y2 = min(actual_h, y1 + int(crop_box['h'] * h_ratio))
-            
-            out_w = x2 - x1
-            out_h = y2 - y1
-        else:
-            x1, y1, x2, y2 = 0, 0, actual_w, actual_h
-            out_w, out_h = actual_w, actual_h
+            x = max(0, int(crop_box['x'] * w_ratio))
+            y = max(0, int(crop_box['y'] * h_ratio))
+            w = min(actual_w - x, int(crop_box['w'] * w_ratio))
+            h = min(actual_h - y, int(crop_box['h'] * h_ratio))
+            crop_filter = f"crop={w}:{h}:{x}:{y}"
 
         target_folder = os.path.join(output_dir, item['source_video'])
         os.makedirs(target_folder, exist_ok=True)
         out_path = os.path.join(target_folder, filename)
 
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        writer = cv2.VideoWriter(out_path, fourcc, actual_fps, (out_w, out_h))
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-ss", f"{start_sec:.4f}",
+            "-i", source_path,
+            "-t", f"{duration_sec:.4f}"
+        ]
 
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-        current_frame = start_frame
+        if is_cropped:
+            cmd.extend(["-vf", crop_filter])
 
-        while current_frame <= end_frame:
-            ret, frame = cap.read()
-            if not ret:
-                break
+        cmd.extend([
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            out_path
+        ])
 
-            if is_cropped:
-                frame = frame[y1:y2, x1:x2]
-
-            writer.write(frame)
-            current_frame += 1
-
-        cap.release()
-        writer.release()
-        
-        new_annotations.append(new_item)
+        try:
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            if result.returncode != 0:
+                print(f"  [FFmpeg Error] {result.stderr}")
+            else:
+                new_annotations.append(new_item)
+        except FileNotFoundError:
+            print("  [Fatal Error] 'ffmpeg' command not found. Please ensure FFmpeg is installed and added to your system PATH.")
+            return
 
     output_json_path = os.path.join(output_dir, output_json_name)
     with open(output_json_path, 'w', encoding='utf-8') as f:
@@ -138,9 +147,10 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    process_videos_opencv(
+    process_videos_with_audio(
         annotation_file=args.annotation, 
         source_dir=args.source_dir, 
         output_dir=args.output_dir, 
         output_json_name=args.output_json
     )
+    
